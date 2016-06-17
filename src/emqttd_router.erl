@@ -1,179 +1,241 @@
-%%%-----------------------------------------------------------------------------
-%%% Copyright (c) 2012-2015 eMQTT.IO, All Rights Reserved.
-%%%
-%%% Permission is hereby granted, free of charge, to any person obtaining a copy
-%%% of this software and associated documentation files (the "Software"), to deal
-%%% in the Software without restriction, including without limitation the rights
-%%% to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-%%% copies of the Software, and to permit persons to whom the Software is
-%%% furnished to do so, subject to the following conditions:
-%%%
-%%% The above copyright notice and this permission notice shall be included in all
-%%% copies or substantial portions of the Software.
-%%%
-%%% THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-%%% IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-%%% FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-%%% AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-%%% LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-%%% OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-%%% SOFTWARE.
-%%%-----------------------------------------------------------------------------
-%%% @doc MQTT Message Router on Local Node
-%%%
-%%% Route Table:
-%%%
-%%%   Topic -> Pid1, Pid2, ...
-%%%
-%%% Reverse Route Table:
-%%%
-%%%   Pid -> Topic1, Topic2, ...
-%%%
-%%% @end
-%%%
-%%% @author Feng Lee <feng@emqtt.io>
-%%%-----------------------------------------------------------------------------
+%%--------------------------------------------------------------------
+%% Copyright (c) 2012-2016 Feng Lee <feng@emqtt.io>.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+%%--------------------------------------------------------------------
+
 -module(emqttd_router).
+
+-behaviour(gen_server).
 
 -include("emqttd.hrl").
 
--include("emqttd_protocol.hrl").
+%% Mnesia Bootstrap
+-export([mnesia/1]).
 
--export([init/1, route/2, lookup_routes/1, has_route/1,
-         add_routes/2, delete_routes/1, delete_routes/2]).
+-boot_mnesia({mnesia, [boot]}).
+-copy_mnesia({mnesia, [copy]}).
 
--ifdef(TEST).
--compile(export_all).
--endif.
+%% Start/Stop
+-export([start_link/0, stop/0]).
 
-%%------------------------------------------------------------------------------
-%% @doc Create route tables.
-%% @end
-%%------------------------------------------------------------------------------
-init(_Opts) ->
-    TabOpts = [bag, public, named_table,
-               {write_concurrency, true}],
-    %% Route Table: Topic -> {Pid, QoS}
-    %% Route Shard: {Topic, Shard} -> {Pid, QoS}
-    ensure_tab(route, TabOpts),
+%% Route APIs
+-export([add_route/1, add_route/2, add_routes/1, lookup/1, print/1,
+         del_route/1, del_route/2, del_routes/1, has_route/1]).
 
-    %% Reverse Route Table: Pid -> {Topic, QoS}
-    ensure_tab(reverse_route, TabOpts).
+%% gen_server Function Exports
+-export([init/1, handle_call/3, handle_cast/2, handle_info/2,
+         terminate/2, code_change/3]).
 
-ensure_tab(Tab, Opts) ->
-    case ets:info(Tab, name) of
-        undefined ->
-            ets:new(Tab, Opts);
-        _ ->
-            ok
+-record(state, {stats_timer}).
+
+%%--------------------------------------------------------------------
+%% Mnesia Bootstrap
+%%--------------------------------------------------------------------
+
+mnesia(boot) ->
+    ok = emqttd_mnesia:create_table(route, [
+                {type, bag},
+                {ram_copies, [node()]},
+                {record_name, mqtt_route},
+                {attributes, record_info(fields, mqtt_route)}]);
+
+mnesia(copy) ->
+    ok = emqttd_mnesia:copy_table(route, ram_copies).
+
+%%--------------------------------------------------------------------
+%% Start the Router
+%%--------------------------------------------------------------------
+
+start_link() ->
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
+
+%%--------------------------------------------------------------------
+%% API
+%%--------------------------------------------------------------------
+
+%% @doc Lookup Routes.
+-spec(lookup(Topic:: binary()) -> [mqtt_route()]).
+lookup(Topic) when is_binary(Topic) ->
+    Matched = mnesia:async_dirty(fun emqttd_trie:match/1, [Topic]),
+    %% Optimize: route table will be replicated to all nodes.
+    lists:append([ets:lookup(route, To) || To <- [Topic | Matched]]).
+
+%% @doc Print Routes.
+-spec(print(Topic :: binary()) -> [ok]).
+print(Topic) ->
+    [io:format("~s -> ~s~n", [To, Node]) ||
+        #mqtt_route{topic = To, node = Node} <- lookup(Topic)].
+
+%% @doc Add Route
+-spec(add_route(binary() | mqtt_route()) -> ok | {error, Reason :: any()}).
+add_route(Topic) when is_binary(Topic) ->
+    add_route(#mqtt_route{topic = Topic, node = node()});
+add_route(Route) when is_record(Route, mqtt_route) ->
+    add_routes([Route]).
+
+-spec(add_route(Topic :: binary(), Node :: node()) -> ok | {error, Reason :: any()}).
+add_route(Topic, Node) when is_binary(Topic), is_atom(Node) ->
+    add_route(#mqtt_route{topic = Topic, node = Node}).
+
+%% @doc Add Routes
+-spec(add_routes([mqtt_route()]) -> ok | {errory, Reason :: any()}).
+add_routes(Routes) ->
+    AddFun = fun() -> [add_route_(Route) || Route <- Routes] end,
+    case mnesia:is_transaction() of
+        true  -> AddFun();
+        false -> trans(AddFun)
     end.
 
-%%------------------------------------------------------------------------------
-%% @doc Add Routes.
-%% @end
-%%------------------------------------------------------------------------------
--spec add_routes(list(binary()), pid()) -> ok.
-add_routes(Topics, Pid) when is_pid(Pid) ->
-    with_stats(fun() ->
-        case lookup_routes(Pid) of
-            [] ->
-                erlang:monitor(process, Pid),
-                insert_routes(Topics, Pid);
-            InEts ->
-                insert_routes(Topics -- InEts, Pid)
-        end
-    end).
+%% @private
+add_route_(Route = #mqtt_route{topic = Topic}) ->
+    case mnesia:wread({route, Topic}) of
+        [] ->
+            case emqttd_topic:wildcard(Topic) of
+                true  -> emqttd_trie:insert(Topic);
+                false -> ok
+            end,
+            mnesia:write(route, Route, write);
+        Records ->
+            case lists:member(Route, Records) of
+                true  -> ok;
+                false -> mnesia:write(route, Route, write)
+            end
+    end.
 
-%%------------------------------------------------------------------------------
-%% @doc Lookup Routes
-%% @end
-%%------------------------------------------------------------------------------
--spec lookup_routes(pid()) -> list(binary()).
-lookup_routes(Pid) when is_pid(Pid) ->
-    [Topic || {_, Topic} <- ets:lookup(reverse_route, Pid)].
+%% @doc Delete Route
+-spec(del_route(binary() | mqtt_route()) -> ok | {error, Reason :: any()}).
+del_route(Topic) when is_binary(Topic) ->
+    del_route(#mqtt_route{topic = Topic, node = node()});
+del_route(Route) when is_record(Route, mqtt_route) ->
+    del_routes([Route]).
 
-%%------------------------------------------------------------------------------
-%% @doc Has Route?
-%% @end
-%%------------------------------------------------------------------------------
--spec has_route(binary()) -> boolean().
-has_route(Topic) ->
-    ets:member(route, Topic).
+-spec(del_route(Topic :: binary(), Node :: node()) -> ok | {error, Reason :: any()}).
+del_route(Topic, Node) when is_binary(Topic), is_atom(Node) ->
+    del_route(#mqtt_route{topic = Topic, node = Node}).
 
-%%------------------------------------------------------------------------------
 %% @doc Delete Routes
-%% @end
-%%------------------------------------------------------------------------------
--spec delete_routes(list(binary()), pid()) -> ok.
-delete_routes(Topics, Pid) ->
-    with_stats(fun() ->
-        Routes = [{Topic, Pid} || Topic <- Topics],
-        lists:foreach(fun delete_route/1, Routes)
-    end).
-
--spec delete_routes(pid()) -> ok.
-delete_routes(Pid) when is_pid(Pid) ->
-    with_stats(fun() ->
-        Routes = [{Topic, Pid} || Topic <- lookup_routes(Pid)],
-        ets:delete(reverse_route, Pid),
-        lists:foreach(fun delete_route_only/1, Routes)
-    end).
-
-%%------------------------------------------------------------------------------
-%% @doc Route Message on Local Node.
-%% @end
-%%------------------------------------------------------------------------------
--spec route(binary(), mqtt_message()) -> non_neg_integer().
-route(Queue = <<"$Q/", _Q>>, Msg) ->
-    case ets:lookup(route, Queue) of
-        [] ->
-            emqttd_metrics:inc('messages/dropped');
-        Routes ->
-            Idx = crypto:rand_uniform(1, length(Routes) + 1),
-            {_, SubPid} = lists:nth(Idx, Routes),
-            dispatch(SubPid, Queue, Msg)
-    end;
-
-route(Topic, Msg) ->
-    case ets:lookup(route, Topic) of
-        [] ->
-            emqttd_metrics:inc('messages/dropped');
-        Routes ->
-            lists:foreach(fun({_Topic, SubPid}) ->
-                            dispatch(SubPid, Topic, Msg)
-                          end, Routes)
+-spec(del_routes([mqtt_route()]) -> ok | {error, any()}).
+del_routes(Routes) ->
+    DelFun = fun() -> [del_route_(Route) || Route <- Routes] end,
+    case mnesia:is_transaction() of
+        true  -> DelFun();
+        false -> trans(DelFun)
     end.
 
-dispatch(SubPid, Topic, Msg) -> SubPid ! {dispatch, Topic, Msg}.
+del_route_(Route = #mqtt_route{topic = Topic}) ->
+    case mnesia:wread({route, Topic}) of
+        [] ->
+            ok;
+        [Route] ->
+            %% Remove route and trie
+            mnesia:delete_object(route, Route, write),
+            case emqttd_topic:wildcard(Topic) of
+                true  -> emqttd_trie:delete(Topic);
+                false -> ok
+            end;
+        _More ->
+            %% Remove route only
+            mnesia:delete_object(route, Route, write)
+    end.
 
-%%%=============================================================================
-%%% Internal Functions
-%%%=============================================================================
+%% @doc Has Route?
+-spec(has_route(binary()) -> boolean()).
+has_route(Topic) ->
+    Routes = case mnesia:is_transaction() of
+                 true  -> mnesia:read(route, Topic);
+                 false -> mnesia:dirty_read(route, Topic)
+             end,
+    length(Routes) > 0.
 
-insert_routes([], _Pid) ->
-    ok;
-insert_routes(Topics, Pid) ->
-    {Routes, ReverseRoutes} = routes(Topics, Pid),
-    ets:insert(route, Routes),
-    ets:insert(reverse_route, ReverseRoutes).
+%% @private
+-spec(trans(function()) -> ok | {error, any()}).
+trans(Fun) ->
+    case mnesia:transaction(Fun) of
+        {atomic, _}      -> ok;
+        {aborted, Error} -> {error, Error}
+    end.
 
-routes(Topics, Pid) ->
-    lists:unzip([{{Topic, Pid}, {Pid, Topic}} || Topic <- Topics]).
+stop() -> gen_server:call(?MODULE, stop).
 
-delete_route({Topic, Pid}) ->
-    ets:delete_object(reverse_route, {Pid, Topic}),
-    ets:delete_object(route, {Topic, Pid}).
+%%--------------------------------------------------------------------
+%% gen_server Callbacks
+%%--------------------------------------------------------------------
 
-delete_route_only({Topic, Pid}) ->
-    ets:delete_object(route, {Topic, Pid}).
+init([]) ->
+    mnesia:subscribe(system),
+    {ok, TRef}  = timer:send_interval(timer:seconds(1), stats),
+    {ok, #state{stats_timer = TRef}}.
 
-with_stats(Fun) ->
-    Ok = Fun(), setstats(), Ok.
+handle_call(stop, _From, State) ->
+    {stop, normal, ok, State};
 
-setstats() ->
-    lists:foreach(fun setstat/1, [{route, 'routes/count'},
-                                  {reverse_route, 'routes/reverse'}]).
+handle_call(_Req, _From, State) ->
+    {reply, ignore, State}.
 
-setstat({Tab, Stat}) ->
-    emqttd_stats:setstat(Stat, ets:info(Tab, size)).
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info({mnesia_system_event, {mnesia_up, Node}}, State) ->
+    lager:error("Mnesia up: ~p~n", [Node]),
+    {noreply, State};
+
+handle_info({mnesia_system_event, {mnesia_down, Node}}, State) ->
+    lager:error("Mnesia down: ~p~n", [Node]),
+    clean_routes_(Node),
+    update_stats_(),
+    {noreply, State, hibernate};
+
+handle_info({mnesia_system_event, {inconsistent_database, Context, Node}}, State) ->
+    %% 1. Backup and restart
+    %% 2. Set master nodes
+    lager:critical("Mnesia inconsistent_database event: ~p, ~p~n", [Context, Node]),
+    {noreply, State};
+
+handle_info({mnesia_system_event, {mnesia_overload, Details}}, State) ->
+    lager:critical("Mnesia overload: ~p~n", [Details]),
+    {noreply, State};
+
+handle_info({mnesia_system_event, _Event}, State) ->
+    {noreply, State};
+
+handle_info(stats, State) ->
+    update_stats_(),
+    {noreply, State, hibernate};
+
+handle_info(_Info, State) ->
+    {noreply, State}.
+
+terminate(_Reason, #state{stats_timer = TRef}) ->
+    timer:cancel(TRef),
+    mnesia:unsubscribe(system).
+
+code_change(_OldVsn, State, _Extra) ->
+    {ok, State}.
+
+%%--------------------------------------------------------------------
+%% Internal Functions
+%%--------------------------------------------------------------------
+
+%% Clean Routes on Node
+clean_routes_(Node) ->
+    Pattern = #mqtt_route{_ = '_', node = Node},
+    Clean = fun() ->
+                [mnesia:delete_object(route, R, write) ||
+                    R <- mnesia:match_object(route, Pattern, write)]
+            end,
+    mnesia:transaction(Clean).
+
+update_stats_() ->
+    emqttd_stats:setstats('routes/count', 'routes/max', mnesia:table_info(route, size)).
 
